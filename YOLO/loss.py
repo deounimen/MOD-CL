@@ -3,7 +3,7 @@ from ultralytics.utils.tal import *
 
 import torch
 import torch.nn as nn
-
+import sys
 import numpy as np
 
 
@@ -37,7 +37,7 @@ class YOLOLoss(v8DetectionLoss):
 
 
     def preprocess(self, targets, batch_size, scale_tensor):
-        """Preprocesses the target counts and matches with the input batch size to output a tensor."""
+        """Preprocess target counts and align with batch size to output a tensor."""
         if targets.shape[0] == 0:
             out = torch.zeros(batch_size, 0, targets.shape[1]-1, device=self.device)
         else:
@@ -55,7 +55,7 @@ class YOLOLoss(v8DetectionLoss):
     
 
     def __call__(self, preds, batch):
-        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+        """Calculate the sum of losses for box, cls, and dfl multiplied by batch size."""
 
         loss = torch.zeros(3 + int(self.req_loss), device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
@@ -159,7 +159,7 @@ class CustomTaskAlignedAssigner(TaskAlignedAssigner):
         align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt, gt_labels_nhot)
         # Get topk_metric mask, (b, max_num_obj, h*w)
         mask_topk = self.select_topk_candidates(align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool())
-        # Merge all mask to a final mask, (b, max_num_obj, h*w)
+        # Merge all masks to a final mask, (b, max_num_obj, h*w)
         mask_pos = mask_topk * mask_in_gts * mask_gt
 
         return mask_pos, align_metric, overlaps
@@ -168,14 +168,26 @@ class CustomTaskAlignedAssigner(TaskAlignedAssigner):
         """Compute alignment metric given predicted and ground truth bounding boxes."""
         na = pd_bboxes.shape[-2]
         mask_gt = mask_gt.bool()  # b, max_num_obj, h*w
+
+        # Initialize tensors and align dtype/device
         overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
         bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
 
-        ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)  # 2, b, max_num_obj
-        ind[0] = torch.arange(end=self.bs).view(-1, 1).expand(-1, self.n_max_boxes)  # b, max_num_obj
-        ind[1] = gt_labels.squeeze(-1)  # b, max_num_obj
-        # Get the scores of each grid for each gt cls
-        bbox_scores[mask_gt] = (torch.sum(pd_scores[ind[0]] * gt_labels_nhot.unsqueeze(-2).repeat(1,1,na,1), dim=-1).to(dtype=torch.float16))[mask_gt]
+        # Move index tensors to the same device and ensure correct types
+        ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long, device=pd_scores.device)  # 2, b, max_num_obj
+        ind[0] = torch.arange(end=self.bs, device=pd_scores.device).view(-1, 1).expand(-1, self.n_max_boxes)  # b, max_num_obj
+        ind[1] = gt_labels.squeeze(-1).to(device=pd_scores.device, dtype=torch.long)  # b, max_num_obj
+
+        # Align dtype/device for one-hot labels (avoid half/float conflicts)
+        gt_labels_nhot = gt_labels_nhot.to(dtype=pd_scores.dtype, device=pd_scores.device)
+
+        # Use expand instead of repeat to save memory: [B, M, 1, C] -> [B, M, na, C]
+        gt_nhot_exp = gt_labels_nhot.unsqueeze(-2).expand(-1, -1, na, -1)
+
+        # Compute per-gt-class scores on each grid (keep dtype consistent with pd_scores)
+        score_sum = torch.sum(pd_scores[ind[0]] * gt_nhot_exp, dim=-1)  # [B, M, na], dtype=pd_scores.dtype
+        bbox_scores[mask_gt] = score_sum[mask_gt]  # no longer force-casting to float16
+
         # (b, max_num_obj, 1, 4), (b, 1, h*w, 4)
         pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
         gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
@@ -191,7 +203,6 @@ class CustomTaskAlignedAssigner(TaskAlignedAssigner):
         batch_ind = torch.arange(end=self.bs, dtype=torch.int64, device=gt_labels.device)[..., None]
         target_gt_idx = target_gt_idx + batch_ind * self.n_max_boxes  # (b, h*w)
         target_labels = gt_labels.long().flatten()[target_gt_idx]  # (b, h*w) -> Per anchor, the best target label is decided.
-        # 16*14
 
         # Assigned target boxes, (b, max_num_obj, 4) -> (b, h*w, 4)
         target_bboxes = gt_bboxes.view(-1, 4)[target_gt_idx]
